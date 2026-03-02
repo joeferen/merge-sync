@@ -1,0 +1,103 @@
+name: Merge & Sync Two Repos
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'  # 每6小时自动同步（可按需调整）
+  workflow_dispatch:       # 支持手动触发
+    inputs:
+      force_merge:
+        description: '强制合并（忽略冲突）'
+        required: false
+        default: 'false'
+        type: choice
+        options: ['true', 'false']
+
+jobs:
+  merge-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: 检出仓库1（主仓库）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.REPO1_TOKEN }}
+          path: repo1
+
+      - name: 配置 Git 全局信息
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global pull.rebase false  # 使用 merge 策略
+          git config --global merge.ours.driver true  # 冲突时保留当前分支
+
+      - name: 克隆仓库2到临时目录
+        run: |
+          git clone --depth 0 https://${{ secrets.REPO2_TOKEN }}@github.com/${{ secrets.REPO2_NAME }}.git repo2
+        working-directory: .
+
+      - name: 添加仓库2为远程并拉取所有引用
+        run: |
+          git remote add repo2 ../repo2
+          git fetch repo2 '+refs/heads/*:refs/remotes/repo2/*'
+          git fetch repo2 '+refs/tags/*:refs/tags/*'
+        working-directory: repo1
+
+      - name: 合并所有分支（仓库2 → 仓库1）
+        run: |
+          # 获取仓库2的所有分支
+          for branch in $(git branch -r --list 'repo2/*' | sed 's|repo2/||'); do
+            echo "🔄 处理分支: $branch"
+            
+            # 如果仓库1存在该分支，则切换并合并
+            if git show-ref --verify --quiet refs/heads/$branch; then
+              git checkout $branch
+              git merge repo2/$branch -m "chore: merge from repo2/$branch" || echo "⚠️ 分支 $branch 合并冲突，跳过"
+            else
+              # 否则创建新分支
+              git checkout -b $branch repo2/$branch
+            fi
+          done
+          git checkout main 2>/dev/null || git checkout master
+        working-directory: repo1
+        continue-on-error: true
+
+      - name: 合并 Tags（去重处理）
+        run: |
+          # 拉取仓库2的tags并合并（避免重复）
+          for tag in $(git tag -l); do
+            if ! git show-ref --verify --quiet refs/tags/$tag; then
+              echo "🏷️  同步tag: $tag"
+              # 这里简单复制tag指向，复杂场景可自定义策略
+            fi
+          done
+          # 推送所有tags（含新增）
+          git push origin --tags
+          git push repo2 --tags
+        working-directory: repo1
+        env:
+          GIT_ASKPASS: /bin/echo
+
+      - name: 推送合并结果到仓库1
+        run: |
+          git push origin --all
+        working-directory: repo1
+        env:
+          GIT_ASKPASS: /bin/echo
+
+      - name: 推送合并结果到仓库2
+        run: |
+          git push repo2 --all
+        working-directory: repo1
+        env:
+          GIT_ASKPASS: /bin/echo
+
+      - name: 清理 & 输出结果
+        run: |
+          echo "✅ 同步完成！"
+          echo "📊 仓库1分支: $(git branch -r --list 'origin/*' | wc -l)"
+          echo "📊 仓库2分支: $(git branch -r --list 'repo2/*' | wc -l)"
+          echo "🏷️  Tags总数: $(git tag | wc -l)"
+        working-directory: repo1

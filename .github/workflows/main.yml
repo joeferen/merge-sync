@@ -1,14 +1,28 @@
-name: Merge & Sync Two Repos
+name: Multi-Repo Merge & Sync
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'  # 每6小时自动同步（可按需调整）
-  workflow_dispatch:       # 支持手动触发
+  workflow_dispatch:
     inputs:
-      force_merge:
-        description: '强制合并（忽略冲突）'
+      repo_pairs:
+        description: '仓库对配置（JSON数组）'
+        required: true
+        type: string
+        default: |
+          [
+            {"repo_a": "user/repo1", "repo_b": "user/repo1-mirror", "merge_strategy": "ours"},
+            {"repo_a": "org/project-a", "repo_b": "org/project-a-backup", "merge_strategy": "theirs"}
+          ]
+        # 格式说明见下方👇
+      force_push:
+        description: '强制推送（--force）'
         required: false
         default: 'false'
+        type: choice
+        options: ['true', 'false']
+      sync_tags:
+        description: '同步 tags'
+        required: false
+        default: 'true'
         type: choice
         options: ['true', 'false']
 
@@ -17,87 +31,111 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    strategy:
+      fail-fast: false  # 一组失败不影响其他组
+      matrix:
+        config: ${{ fromJSON(inputs.repo_pairs) }}
     
     steps:
-      - name: 检出仓库1（主仓库）
+      - name: 解析配置
+        id: config
+        run: |
+          echo "repo_a=${{ matrix.config.repo_a }}" >> $GITHUB_OUTPUT
+          echo "repo_b=${{ matrix.config.repo_b }}" >> $GITHUB_OUTPUT
+          echo "strategy=${{ matrix.config.merge_strategy }}" >> $GITHUB_OUTPUT
+
+      - name: 检出仓库A（作为基础）
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.REPO1_TOKEN }}
-          path: repo1
+          token: ${{ secrets.GITHUB_TOKEN }}
+          path: repo_a
 
       - name: 配置 Git 全局信息
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global pull.rebase false  # 使用 merge 策略
-          git config --global merge.ours.driver true  # 冲突时保留当前分支
+          git config --global pull.rebase false
+          # 合并策略：ours(保留A) / theirs(保留B) / auto(默认)
+          if [ "${{ steps.config.outputs.strategy }}" = "ours" ]; then
+            git config --global merge.ours.driver true
+          elif [ "${{ steps.config.outputs.strategy }}" = "theirs" ]; then
+            git config --global merge.theirs.driver true
+          fi
 
-      - name: 克隆仓库2到临时目录
+      - name: 克隆仓库B到临时目录
         run: |
-          git clone --depth 0 https://${{ secrets.REPO2_TOKEN }}@github.com/${{ secrets.REPO2_NAME }}.git repo2
+          git clone --depth 0 https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ steps.config.outputs.repo_b }}.git repo_b
         working-directory: .
 
-      - name: 添加仓库2为远程并拉取所有引用
+      - name: 添加仓库B为远程并拉取所有引用
         run: |
-          git remote add repo2 ../repo2
-          git fetch repo2 '+refs/heads/*:refs/remotes/repo2/*'
-          git fetch repo2 '+refs/tags/*:refs/tags/*'
-        working-directory: repo1
+          git remote add repo_b ../repo_b
+          git fetch repo_b '+refs/heads/*:refs/remotes/repo_b/*'
+          if [ "${{ inputs.sync_tags }}" = "true" ]; then
+            git fetch repo_b '+refs/tags/*:refs/tags/*'
+          fi
+        working-directory: repo_a
 
-      - name: 合并所有分支（仓库2 → 仓库1）
+      - name: 合并所有分支（仓库B → 仓库A）
         run: |
-          # 获取仓库2的所有分支
-          for branch in $(git branch -r --list 'repo2/*' | sed 's|repo2/||'); do
-            echo "🔄 处理分支: $branch"
-            
-            # 如果仓库1存在该分支，则切换并合并
+          echo "🔄 开始合并分支..."
+          for branch in $(git branch -r --list 'repo_b/*' | sed 's|repo_b/||' | grep -v 'HEAD'); do
+            echo "  → 处理: $branch"
             if git show-ref --verify --quiet refs/heads/$branch; then
               git checkout $branch
-              git merge repo2/$branch -m "chore: merge from repo2/$branch" || echo "⚠️ 分支 $branch 合并冲突，跳过"
+              git merge repo_b/$branch -m "chore: merge from ${{ steps.config.outputs.repo_b }}/$branch" || {
+                echo "⚠️ 分支 $branch 合并冲突，按策略处理"
+                if [ "${{ steps.config.outputs.strategy }}" = "ours" ]; then
+                  git merge --strategy-option=ours repo_b/$branch
+                elif [ "${{ steps.config.outputs.strategy }}" = "theirs" ]; then
+                  git merge --strategy-option=theirs repo_b/$branch
+                fi
+              }
             else
-              # 否则创建新分支
-              git checkout -b $branch repo2/$branch
+              git checkout -b $branch repo_b/$branch
             fi
           done
-          git checkout main 2>/dev/null || git checkout master
-        working-directory: repo1
+          # 回到主分支
+          git checkout main 2>/dev/null || git checkout master || true
+        working-directory: repo_a
         continue-on-error: true
 
-      - name: 合并 Tags（去重处理）
+      - name: 同步 Tags（去重+可选）
+        if: inputs.sync_tags == 'true'
         run: |
-          # 拉取仓库2的tags并合并（避免重复）
-          for tag in $(git tag -l); do
-            if ! git show-ref --verify --quiet refs/tags/$tag; then
-              echo "🏷️  同步tag: $tag"
-              # 这里简单复制tag指向，复杂场景可自定义策略
+          echo "🏷️  同步 tags..."
+          for tag in $(git ls-remote --tags repo_b | cut -f2 | sed 's|refs/tags/||'); do
+            if ! git rev-parse "$tag" >/dev/null 2>&1; then
+              echo "  → 新增 tag: $tag"
+              git fetch repo_b tag "$tag":"$tag"
             fi
           done
-          # 推送所有tags（含新增）
-          git push origin --tags
-          git push repo2 --tags
-        working-directory: repo1
+        working-directory: repo_a
+
+      - name: 推送结果到仓库A
+        run: |
+          PUSH_FLAG=""
+          [ "${{ inputs.force_push }}" = "true" ] && PUSH_FLAG="--force"
+          git push $PUSH_FLAG origin --all
+          [ "${{ inputs.sync_tags }}" = "true" ] && git push $PUSH_FLAG origin --tags
+        working-directory: repo_a
         env:
           GIT_ASKPASS: /bin/echo
 
-      - name: 推送合并结果到仓库1
+      - name: 推送结果到仓库B
         run: |
-          git push origin --all
-        working-directory: repo1
+          PUSH_FLAG=""
+          [ "${{ inputs.force_push }}" = "true" ] && PUSH_FLAG="--force"
+          git push $PUSH_FLAG repo_b --all
+          [ "${{ inputs.sync_tags }}" = "true" ] && git push $PUSH_FLAG repo_b --tags
+        working-directory: repo_a
         env:
           GIT_ASKPASS: /bin/echo
 
-      - name: 推送合并结果到仓库2
+      - name: 输出同步报告
         run: |
-          git push repo2 --all
-        working-directory: repo1
-        env:
-          GIT_ASKPASS: /bin/echo
-
-      - name: 清理 & 输出结果
-        run: |
-          echo "✅ 同步完成！"
-          echo "📊 仓库1分支: $(git branch -r --list 'origin/*' | wc -l)"
-          echo "📊 仓库2分支: $(git branch -r --list 'repo2/*' | wc -l)"
-          echo "🏷️  Tags总数: $(git tag | wc -l)"
-        working-directory: repo1
+          echo "✅ [${{ steps.config.outputs.repo_a }} ↔ ${{ steps.config.outputs.repo_b }}] 同步完成"
+          echo "📊 分支数: $(git branch -r | wc -l)"
+          echo "🏷️  Tags数: $(git tag | wc -l)"
+        working-directory: repo_a
